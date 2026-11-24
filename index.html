@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Freigabe</title>
+<style>
+  :root { --grund: #0a0507; --platte: #160b10; --kante: #6b1c2c; --rot: #ff2d4f; --text: #f6ecee; --leise: #b08d94; --cyan: #45f0ff; --gelb: #ffd23f; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--grund); color: var(--text); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 460px; margin: 0 auto; padding: 28px 18px; }
+  .logo { font: 700 13px/1 system-ui; letter-spacing: .25em; color: var(--rot); margin-bottom: 22px; }
+  h1 { font-size: 24px; margin: 0 0 8px; }
+  p { color: var(--leise); margin: 0 0 16px; }
+  .geraet { font: 600 18px ui-monospace, Menlo, Consolas, monospace; color: var(--cyan); margin: 6px 0 2px; }
+  .kasten { background: var(--platte); border: 1px solid var(--kante); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  input { width: 100%; font: inherit; padding: 14px; border-radius: 8px; border: 1px solid var(--kante); background: var(--grund); color: var(--text); margin-bottom: 12px; }
+  input:focus { outline: 2px solid var(--cyan); border-color: transparent; }
+  button { width: 100%; font: 600 17px system-ui; padding: 14px; border-radius: 8px; border: 0; cursor: pointer; margin-bottom: 10px; }
+  .ja { background: var(--rot); color: #16060a; }
+  .nein { background: transparent; color: var(--leise); border: 1px solid var(--kante); }
+  button:disabled { opacity: .5; }
+  .meldung { min-height: 1.5em; font-weight: 600; }
+  .gut { color: var(--cyan); } .schlecht { color: var(--rot); } .info { color: var(--gelb); }
+</style>
+</head>
+<body>
+<main id="m"><div class="logo">DECK//USB</div><p>Wird geprüft …</p></main>
+<script>
+// Öffentlicher Schlüssel deines Sticks. Nur Anfragen, die damit signiert sind, werden angenommen.
+const PUB = 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExcoWeGQ3z3F8qmMAinr48u2O_6Rx6dttfpSmK8ZOy4jYI-STFcPstQXRCnLT8dLVgflBGpKuIb69WoajJe_KfA';
+const INFO = 'deck-freigabe-v1';
+const SERVER = 'https://ntfy.sh';
+const te = new TextEncoder();
+const m = document.getElementById('m');
+
+const b64uZuBytes = (s) => { s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; return Uint8Array.from(atob(s), (c) => c.charCodeAt(0)); };
+const bytesZuB64u = (b) => btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+function el(t, k, i) { const e = document.createElement(t); if (k) e.className = k; if (i != null) e.textContent = i; return e; }
+function zeige(...kinder) { const l = el('div', 'logo', 'DECK//USB'); m.replaceChildren(l, ...kinder); }
+
+async function pruefeSignatur(daten, sig) {
+  const key = await crypto.subtle.importKey('spki', b64uZuBytes(PUB), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+  return crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, b64uZuBytes(sig), te.encode(daten));
+}
+
+async function verschluesseln(anfrage, passwort) {
+  const stick = await crypto.subtle.importKey('raw', b64uZuBytes(anfrage.k), { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const eigen = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'ECDH', public: stick }, eigen.privateKey, 256);
+  const hk = await crypto.subtle.importKey('raw', bits, 'HKDF', false, ['deriveKey']);
+  const aes = await crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: te.encode(anfrage.id), info: te.encode(INFO) }, hk, { name: 'AES-GCM', length: 256 }, false, ['encrypt']);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const c = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: te.encode(anfrage.id) }, aes, te.encode(passwort));
+  return { e: bytesZuB64u(await crypto.subtle.exportKey('raw', eigen.publicKey)), iv: bytesZuB64u(iv), c: bytesZuB64u(c) };
+}
+
+async function sende(thema, obj) {
+  const r = await fetch(SERVER + '/' + thema, { method: 'POST', body: JSON.stringify(obj) });
+  if (!r.ok) throw new Error('Senden fehlgeschlagen (' + r.status + ')');
+}
+
+// Wartet auf die Rückmeldung des Sticks (ok / falsch / abgelehnt).
+async function warteAufStick(thema, seit) {
+  const ende = Date.now() + 90000;
+  while (Date.now() < ende) {
+    await new Promise((ok) => setTimeout(ok, 2500));
+    try {
+      const t = await (await fetch(SERVER + '/' + thema + '/json?poll=1&since=' + seit)).text();
+      for (const z of t.split('\n').filter(Boolean)) {
+        const n = JSON.parse(z);
+        if (n.event !== 'message') continue;
+        try { const p = JSON.parse(n.message); if (p.status) return p.status; } catch {}
+      }
+    } catch {}
+  }
+  return 'zeit';
+}
+
+function vorWieLange(t) {
+  const min = Math.round((Date.now() - t) / 60000);
+  return min < 1 ? 'gerade eben' : 'vor ' + min + ' Min.';
+}
+
+async function start() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  const d = p.get('d'), s = p.get('s');
+  if (!d || !s) { zeige(el('h1', null, 'Keine Anfrage'), el('p', null, 'Diese Seite öffnest du über die Benachrichtigung deines Sticks.')); return; }
+  let daten, anfrage;
+  try { daten = new TextDecoder().decode(b64uZuBytes(d)); anfrage = JSON.parse(daten); } catch { zeige(el('h1', 'schlecht', 'Ungültige Anfrage')); return; }
+  let echt = false;
+  try { echt = await pruefeSignatur(daten, s); } catch {}
+  if (!echt) { zeige(el('h1', 'schlecht', 'Nicht freigeben'), el('p', null, 'Diese Anfrage stammt nicht von deinem Stick. Gib hier kein Passwort ein.')); return; }
+
+  if (anfrage.test) {
+    zeige(el('h1', 'gut', 'Verbindung OK'), el('div', 'geraet', anfrage.g), el('p', null, 'Die Anfrage stammt von deinem Stick, die Signatur stimmt. Die Handy-Freigabe ist startklar.'));
+    return;
+  }
+  if (Date.now() - anfrage.t > 15 * 60000) { zeige(el('h1', 'schlecht', 'Abgelaufen'), el('p', null, 'Diese Anfrage ist älter als 15 Minuten. Starte am Gerät neu.')); return; }
+
+  const pw = el('input'); pw.type = 'password'; pw.placeholder = 'Tresor-Passwort'; pw.autocomplete = 'current-password';
+  const ja = el('button', 'ja', 'Freigeben'); ja.type = 'button';
+  const nein = el('button', 'nein', 'Ablehnen'); nein.type = 'button';
+  const meld = el('div', 'meldung');
+  const kasten = el('div', 'kasten');
+  kasten.append(el('p', null, 'Dieses Gerät möchte eine Sitzung starten (' + vorWieLange(anfrage.t) + '):'), el('div', 'geraet', anfrage.g));
+  zeige(el('h1', null, 'Sitzung freigeben?'), kasten,
+    el('p', null, 'Nur freigeben, wenn DU gerade gestartet hast. Dein Passwort wird hier verschlüsselt, nur dein Stick kann es lesen.'),
+    pw, ja, nein, meld);
+
+  const los = async () => {
+    if (!pw.value) { pw.focus(); return; }
+    ja.disabled = nein.disabled = true; meld.className = 'meldung info'; meld.textContent = 'Wird gesendet …';
+    try {
+      const seit = Math.floor(Date.now() / 1000) - 2;
+      await sende(anfrage.a, await verschluesseln(anfrage, pw.value));
+      pw.value = '';
+      meld.textContent = 'Gesendet. Warte auf den Stick …';
+      const st = await warteAufStick(anfrage.a, seit);
+      if (st === 'ok') { zeige(el('h1', 'gut', 'Freigegeben'), el('div', 'geraet', anfrage.g), el('p', null, 'Die Sitzung startet gleich und erscheint in der Claude-App unter Sessions.')); return; }
+      meld.className = 'meldung schlecht';
+      meld.textContent = st === 'falsch' ? 'Passwort falsch. Bitte nochmal.' : st === 'abgelehnt' ? 'Abgelehnt.' : 'Keine Rückmeldung vom Stick. Läuft er noch?';
+    } catch (e) { meld.className = 'meldung schlecht'; meld.textContent = e.message; }
+    ja.disabled = nein.disabled = false;
+  };
+  ja.addEventListener('click', los);
+  pw.addEventListener('keydown', (e) => { if (e.key === 'Enter') los(); });
+  nein.addEventListener('click', async () => {
+    ja.disabled = nein.disabled = true;
+    try { await sende(anfrage.a, { nein: true }); } catch {}
+    zeige(el('h1', null, 'Abgelehnt'), el('p', null, 'Der Stick startet keine Sitzung.'));
+  });
+  pw.focus();
+}
+start();
+</script>
+</body>
+</html>
